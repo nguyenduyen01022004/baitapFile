@@ -1,0 +1,236 @@
+from flask import Flask, request, jsonify, render_template_string, send_file
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives.serialization import load_pem_private_key, load_pem_public_key
+import os
+import hashlib
+import base64
+import json
+from datetime import datetime
+import tempfile
+import zipfile
+
+app = Flask(__name__)
+
+class DigitalSignatureManager:
+    def __init__(self):
+        self.private_key = None
+        self.public_key = None
+        self.generate_key_pair()
+    
+    def generate_key_pair(self):
+        """Tạo cặp khóa RSA"""
+        self.private_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048
+        )
+        self.public_key = self.private_key.public_key()
+    
+    def sign_file(self, file_content):
+        """Ký số file"""
+        file_hash = hashlib.sha256(file_content).digest()
+        signature = self.private_key.sign(
+            file_hash,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA256()
+        )
+        return base64.b64encode(signature).decode('utf-8')
+    
+    def verify_signature(self, file_content, signature_b64):
+        """Xác minh chữ ký số"""
+        try:
+            signature = base64.b64decode(signature_b64)
+            file_hash = hashlib.sha256(file_content).digest()
+            self.public_key.verify(
+                signature,
+                file_hash,
+                padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.MAX_LENGTH
+                ),
+                hashes.SHA256()
+            )
+            return True
+        except Exception as e:
+            return False
+    
+    def get_public_key_pem(self):
+        """Lấy public key dạng PEM"""
+        return self.public_key.serialize(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode('utf-8')
+
+# Khởi tạo manager ký số
+signature_manager = DigitalSignatureManager()
+
+# Dictionary lưu trữ file đã upload
+uploaded_files = {}
+
+@app.route('/')
+def index():
+    """Serve giao diện HTML"""
+    try:
+        with open('index.html', 'r', encoding='utf-8') as f:
+            return f.read()
+    except FileNotFoundError:
+        return """
+        <h1>Lỗi: Không tìm thấy file index.html</h1>
+        <p>Vui lòng đảm bảo file index.html nằm cùng thư mục với app.py</p>
+        """
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    """Upload và ký số file"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({'success': False, 'message': 'Không có file được chọn'})
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'success': False, 'message': 'Không có file được chọn'})
+        
+        # Đọc nội dung file
+        file_content = file.read()
+        file_size = len(file_content)
+        
+        # Tạo chữ ký số
+        signature = signature_manager.sign_file(file_content)
+        
+        # Tạo ID duy nhất cho file
+        file_id = hashlib.md5(f"{file.filename}{datetime.now()}".encode()).hexdigest()
+        
+        # Lưu thông tin file
+        uploaded_files[file_id] = {
+            'filename': file.filename,
+            'content': file_content,
+            'signature': signature,
+            'size': file_size,
+            'upload_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'hash': hashlib.sha256(file_content).hexdigest()
+        }
+        
+        return jsonify({
+            'success': True,
+            'message': 'File đã được upload và ký số thành công',
+            'file_id': file_id,
+            'filename': file.filename,
+            'size': file_size,
+            'signature': signature,
+            'hash': hashlib.sha256(file_content).hexdigest(),
+            'upload_time': uploaded_files[file_id]['upload_time']
+        })
+        
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Lỗi: {str(e)}'})
+
+@app.route('/verify', methods=['POST'])
+def verify_file():
+    """Xác minh chữ ký số của file"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({'success': False, 'message': 'Không có file được chọn'})
+        
+        file = request.files['file']
+        signature_b64 = request.form.get('signature', '')
+        
+        if not signature_b64:
+            return jsonify({'success': False, 'message': 'Vui lòng nhập chữ ký số'})
+        
+        file_content = file.read()
+        is_valid = signature_manager.verify_signature(file_content, signature_b64)
+        
+        return jsonify({
+            'success': True,
+            'valid': is_valid,
+            'message': 'Chữ ký hợp lệ' if is_valid else 'Chữ ký không hợp lệ',
+            'filename': file.filename,
+            'hash': hashlib.sha256(file_content).hexdigest()
+        })
+        
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Lỗi: {str(e)}'})
+
+@app.route('/download/<file_id>')
+def download_file(file_id):
+    """Download file đã upload"""
+    if file_id not in uploaded_files:
+        return jsonify({'success': False, 'message': 'File không tồn tại'})
+    
+    file_info = uploaded_files[file_id]
+    
+    # Tạo file tạm thời
+    temp_file = tempfile.NamedTemporaryFile(delete=False)
+    temp_file.write(file_info['content'])
+    temp_file.close()
+    
+    return send_file(
+        temp_file.name,
+        as_attachment=True,
+        download_name=file_info['filename']
+    )
+
+@app.route('/download_package/<file_id>')
+def download_package(file_id):
+    """Download gói file bao gồm file gốc + chữ ký + public key"""
+    if file_id not in uploaded_files:
+        return jsonify({'success': False, 'message': 'File không tồn tại'})
+    
+    file_info = uploaded_files[file_id]
+    
+    # Tạo file zip tạm thời
+    temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+    
+    with zipfile.ZipFile(temp_zip.name, 'w') as zip_file:
+        # Thêm file gốc
+        zip_file.writestr(file_info['filename'], file_info['content'])
+        
+        # Thêm chữ ký
+        signature_info = {
+            'filename': file_info['filename'],
+            'signature': file_info['signature'],
+            'hash': file_info['hash'],
+            'upload_time': file_info['upload_time']
+        }
+        zip_file.writestr('signature.json', json.dumps(signature_info, indent=2, ensure_ascii=False))
+        
+        # Thêm public key
+        zip_file.writestr('public_key.pem', signature_manager.get_public_key_pem())
+    
+    return send_file(
+        temp_zip.name,
+        as_attachment=True,
+        download_name=f"{file_info['filename']}_signed_package.zip"
+    )
+
+@app.route('/list_files')
+def list_files():
+    """Liệt kê các file đã upload"""
+    files_list = []
+    for file_id, file_info in uploaded_files.items():
+        files_list.append({
+            'id': file_id,
+            'filename': file_info['filename'],
+            'size': file_info['size'],
+            'upload_time': file_info['upload_time'],
+            'hash': file_info['hash']
+        })
+    
+    return jsonify({'success': True, 'files': files_list})
+
+@app.route('/public_key')
+def get_public_key():
+    """Lấy public key"""
+    return jsonify({
+        'success': True,
+        'public_key': signature_manager.get_public_key_pem()
+    })
+
+if __name__ == '__main__':
+    print("🚀 Ứng dụng truyền file với ký số đang khởi động...")
+    print("🌐 Truy cập: http://localhost:5000")
+    print("📁 Đảm bảo file index.html nằm cùng thư mục với app.py")
+    app.run(debug=True, host='0.0.0.0', port=5000)
